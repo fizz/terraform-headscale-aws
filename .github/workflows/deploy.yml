@@ -1,0 +1,376 @@
+name: "Deploy Headscale"
+
+run-name: "${{ inputs.action }} headscale (${{ inputs.environment }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      environment:
+        description: 'Environment (or "all")'
+        required: true
+        default: 'all'
+        type: string
+      rotate_auth_key:
+        description: 'Rotate auth key for subnet routers'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TF_VERSION: "1.10.0"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # discover — scan environments/ for directories, build JSON matrix
+  # ---------------------------------------------------------------------------
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      coordinator: ${{ steps.find.outputs.coordinator }}
+      routers: ${{ steps.find.outputs.routers }}
+      has_coordinator: ${{ steps.find.outputs.has_coordinator }}
+      has_routers: ${{ steps.find.outputs.has_routers }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find environments
+        id: find
+        run: |
+          set -euo pipefail
+
+          coordinator=""
+          routers="[]"
+
+          # Iterate over directories under environments/
+          for dir in environments/*/; do
+            # Strip trailing slash to get bare directory name
+            env_name="$(basename "$dir")"
+
+            # Each environment must have a metadata.json
+            metadata_file="${dir}metadata.json"
+            if [ ! -f "$metadata_file" ]; then
+              echo "WARNING: ${dir} has no metadata.json, skipping" >&2
+              continue
+            fi
+
+            role_arn="$(jq -r '.role_arn' "$metadata_file")"
+            region="$(jq -r '.region // "us-east-1"' "$metadata_file")"
+
+            if [ -z "$role_arn" ] || [ "$role_arn" = "null" ]; then
+              echo "WARNING: ${dir} metadata.json missing role_arn, skipping" >&2
+              continue
+            fi
+
+            entry="$(jq -n \
+              --arg name "$env_name" \
+              --arg role_arn "$role_arn" \
+              --arg region "$region" \
+              --arg dir "$dir" \
+              '{name: $name, role_arn: $role_arn, region: $region, directory: $dir}')"
+
+            if [ -f "${dir}.coordinator" ]; then
+              coordinator="$entry"
+            else
+              routers="$(echo "$routers" | jq --argjson e "$entry" '. + [$e]')"
+            fi
+          done
+
+          # If a specific environment was requested (not "all"), filter
+          if [ "${{ inputs.environment }}" != "all" ]; then
+            target="${{ inputs.environment }}"
+
+            # Check if target is the coordinator
+            if [ -n "$coordinator" ]; then
+              coord_name="$(echo "$coordinator" | jq -r '.name')"
+              if [ "$coord_name" != "$target" ]; then
+                coordinator=""
+              fi
+            fi
+
+            # Filter routers to only the target
+            routers="$(echo "$routers" | jq --arg t "$target" '[.[] | select(.name == $t)]')"
+          fi
+
+          # Determine flags for conditional job execution
+          has_coordinator="false"
+          has_routers="false"
+          if [ -n "$coordinator" ]; then
+            has_coordinator="true"
+          fi
+          router_count="$(echo "$routers" | jq 'length')"
+          if [ "$router_count" -gt 0 ]; then
+            has_routers="true"
+          fi
+
+          # Write outputs
+          echo "coordinator=${coordinator}" >> "$GITHUB_OUTPUT"
+          echo "routers=${routers}" >> "$GITHUB_OUTPUT"
+          echo "has_coordinator=${has_coordinator}" >> "$GITHUB_OUTPUT"
+          echo "has_routers=${has_routers}" >> "$GITHUB_OUTPUT"
+
+          # Summary
+          echo "### Discovered environments" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$coordinator" ]; then
+            echo "- Coordinator: $(echo "$coordinator" | jq -r '.name')" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Coordinator: none" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "- Routers: ${router_count}" >> "$GITHUB_STEP_SUMMARY"
+          echo "$routers" | jq -r '.[].name' | while read -r name; do
+            echo "  - ${name}" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  # ---------------------------------------------------------------------------
+  # coordinator — deploy the coordination server environment first
+  # ---------------------------------------------------------------------------
+  coordinator:
+    needs: discover
+    if: needs.discover.outputs.has_coordinator == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ fromJson(needs.discover.outputs.coordinator).directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ fromJson(needs.discover.outputs.coordinator).role_arn }}
+          aws-region: ${{ fromJson(needs.discover.outputs.coordinator).region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        if: inputs.action == 'plan'
+        run: >
+          terraform plan -input=false
+          -var="oidc_client_id=${{ secrets.OIDC_CLIENT_ID }}"
+
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        run: >
+          terraform apply -input=false -auto-approve
+          -var="oidc_client_id=${{ secrets.OIDC_CLIENT_ID }}"
+
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        run: >
+          terraform destroy -input=false -auto-approve
+          -var="oidc_client_id=${{ secrets.OIDC_CLIENT_ID }}"
+
+  # ---------------------------------------------------------------------------
+  # rotate-auth-key — generate a new pre-auth key on the coordination server
+  #
+  # Runs after coordinator succeeds (or is skipped), before routers.
+  # Uses SSM RunCommand to create a reusable pre-auth key on the Headscale
+  # instance, then stores it in SSM Parameter Store in each router's account.
+  # ---------------------------------------------------------------------------
+  rotate-auth-key:
+    needs: [discover, coordinator]
+    if: |
+      always() &&
+      inputs.rotate_auth_key &&
+      needs.discover.outputs.has_coordinator == 'true' &&
+      (needs.coordinator.result == 'success' || needs.coordinator.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      auth_key: ${{ steps.generate.outputs.auth_key }}
+    steps:
+      - name: Configure AWS credentials (coordinator account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ fromJson(needs.discover.outputs.coordinator).role_arn }}
+          aws-region: ${{ fromJson(needs.discover.outputs.coordinator).region }}
+
+      - name: Generate auth key via SSM
+        id: generate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Find the running Headscale coordination server instance
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=headscale*" \
+              "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId | [0]" \
+            --output text)
+
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::Headscale coordination server instance not found"
+            exit 1
+          fi
+          echo "Found coordination server: ${INSTANCE_ID}"
+
+          # Create a reusable pre-auth key (valid 1 year)
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --instance-ids "$INSTANCE_ID" \
+            --parameters '{"commands":["/usr/local/bin/headscale --config /etc/headscale/config.yaml preauthkeys create --user 1 --reusable --expiration 8760h -o json"]}' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Waiting for SSM command ${COMMAND_ID}..."
+
+          # Poll for completion (up to 3 minutes)
+          for _ in $(seq 1 90); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            case "$STATUS" in
+              Success)
+                OUTPUT=$(aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query "StandardOutputContent" \
+                  --output text)
+
+                AUTH_KEY=$(echo "$OUTPUT" | jq -r '.key')
+                if [ -z "$AUTH_KEY" ] || [ "$AUTH_KEY" = "null" ]; then
+                  echo "::error::Failed to parse auth key from Headscale output"
+                  echo "Raw output: ${OUTPUT}" >&2
+                  exit 1
+                fi
+
+                # Mask the key in logs
+                echo "::add-mask::${AUTH_KEY}"
+                echo "auth_key=${AUTH_KEY}" >> "$GITHUB_OUTPUT"
+                echo "Auth key generated successfully"
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "::error::SSM command ${STATUS}"
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --output json >&2
+                exit 1
+                ;;
+            esac
+            sleep 2
+          done
+
+          echo "::error::Timed out waiting for SSM command"
+          exit 1
+
+      # Store the auth key in SSM in each router's account
+      - name: Store auth key in router accounts
+        if: steps.generate.outputs.auth_key != ''
+        shell: bash
+        env:
+          AUTH_KEY: ${{ steps.generate.outputs.auth_key }}
+          ROUTERS_JSON: ${{ needs.discover.outputs.routers }}
+        run: |
+          set -euo pipefail
+
+          echo "$ROUTERS_JSON" | jq -c '.[]' | while read -r router; do
+            name="$(echo "$router" | jq -r '.name')"
+            role_arn="$(echo "$router" | jq -r '.role_arn')"
+            region="$(echo "$router" | jq -r '.region')"
+
+            echo "Storing auth key for router: ${name}"
+
+            # Assume the router account's role via STS
+            CREDS=$(aws sts assume-role \
+              --role-arn "$role_arn" \
+              --role-session-name "rotate-auth-key-${name}" \
+              --query "Credentials" \
+              --output json)
+
+            export AWS_ACCESS_KEY_ID="$(echo "$CREDS" | jq -r '.AccessKeyId')"
+            export AWS_SECRET_ACCESS_KEY="$(echo "$CREDS" | jq -r '.SecretAccessKey')"
+            export AWS_SESSION_TOKEN="$(echo "$CREDS" | jq -r '.SessionToken')"
+
+            aws ssm put-parameter \
+              --name /headscale/auth-key \
+              --type SecureString \
+              --value "$AUTH_KEY" \
+              --overwrite \
+              --region "$region"
+
+            echo "Stored auth key for ${name}"
+
+            # Clear assumed-role creds before next iteration
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          done
+
+  # ---------------------------------------------------------------------------
+  # routers — deploy subnet router environments in parallel
+  # ---------------------------------------------------------------------------
+  routers:
+    needs: [discover, coordinator, rotate-auth-key]
+    if: |
+      always() &&
+      needs.discover.outputs.has_routers == 'true' &&
+      (needs.coordinator.result == 'success' || needs.coordinator.result == 'skipped') &&
+      (needs.rotate-auth-key.result == 'success' || needs.rotate-auth-key.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        router: ${{ fromJson(needs.discover.outputs.routers) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.router.directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.router.role_arn }}
+          aws-region: ${{ matrix.router.region }}
+
+      - name: Verify auth key exists in SSM
+        if: inputs.action != 'destroy' && inputs.rotate_auth_key != true
+        run: |
+          aws ssm get-parameter \
+            --name /headscale/auth-key \
+            --with-decryption \
+            --query 'Parameter.Value' \
+            --output text >/dev/null
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        if: inputs.action == 'plan'
+        run: terraform plan -input=false
+
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        run: terraform apply -input=false -auto-approve
+
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        run: terraform destroy -input=false -auto-approve
