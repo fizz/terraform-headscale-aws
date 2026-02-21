@@ -1,0 +1,23 @@
+aws_region = "us-east-1"
+
+# Cross-account IAM roles
+dev_role_arn  = "arn:aws:iam::111111111111:role/TerraformHeadscaleRole"
+prod_role_arn = "arn:aws:iam::222222222222:role/TerraformHeadscaleRole"
+
+# VPCs
+dev_vpc_id  = "vpc-0abc1234dev"
+prod_vpc_id = "vpc-0abc1234prod"
+
+# Coordination server
+headscale_domain = "vpn.vanguard.dev"
+oidc_client_id   = "your-google-oauth-client-id.apps.googleusercontent.com"
+allowed_domains  = ["vanguard.dev"]
+
+# Route advertisement
+dev_advertised_routes  = ["10.0.0.0/16"]
+prod_advertised_routes = ["10.1.0.0/16"]
+dev_advertise_tags     = "tag:dev"
+prod_advertise_tags    = "tag:prod"
+
+# Prod subnet router
+prod_hostname = "prod-subnet-router"
