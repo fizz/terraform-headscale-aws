@@ -37,12 +37,13 @@ data "aws_caller_identity" "current" {}
 
 locals {
   selected_subnet_id = var.subnet_id != null ? var.subnet_id : data.aws_subnets.private.ids[0]
+  ami_id             = var.ami_id != null ? var.ami_id : data.aws_ami.al2023_arm.id
 }
 
 # Security Group - egress only, no inbound needed for subnet router
 resource "aws_security_group" "this" {
   name        = "${var.name_prefix}-subnet-router"
-  description = "Headscale subnet router - outbound only"
+  description = var.sg_description
   vpc_id      = var.vpc_id
 
   egress {
@@ -167,7 +168,7 @@ resource "aws_cloudwatch_log_group" "this" {
 
 # EC2 Instance - subnet router only (no Headscale server)
 resource "aws_instance" "this" {
-  ami                    = data.aws_ami.al2023_arm.id
+  ami                    = local.ami_id
   instance_type          = var.instance_type
   subnet_id              = local.selected_subnet_id
   vpc_security_group_ids = [aws_security_group.this.id]
